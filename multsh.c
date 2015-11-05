@@ -13,40 +13,69 @@
  * the file COPYING.gpl-v3 for details.    
  */
 #define _XOPEN_SOURCE
+#include <sys/select.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "tty_functions.h"
 
 #define BUFSIZE 2048
 
-struct termSession {
-  int fd;       /* slave pty for session */
+struct session {
+  int fd;       /* master pty for session */
   int sfd;      /* socket file descriptor */
-  int pid;      /* pid of the child process */
   int ridx;     /* read index buffer */
   int wridx;    /* write index for buff */
   int rsize;    /* size of the read buffer */
   int wrsize;   /* size of the write buffer */
-  unsigned char rbuf[BUFSIZE];
-  unsigned char wrbuf[BUFSIZE];
+  unsigned char rbuf[BUFSIZE];  /* read buffer */
+  unsigned char wrbuf[BUFSIZE]; /* write buffer */
+  enum {CONTROLLER, CLIENT, SHELL} type;  /* the type of the session */
+  struct session *next;
 };
 
-// Global vars
-static const char *shell;
+/* Global vars */
+static const char *shellCmd;
 static int port;
+static struct session *sessions;  /* linked list of sessions */
+static struct session *shell;     /* the shell session (in the session list) */
+static int shellPid;
+static struct termios termPrev;   /* the starting status of our terminal */
+static int run;
 
 int getPty();
 int openSlave(int fd, int flags);
 void parseCmdLine(int argc, char **argv);
 int startShell();
+struct session *newSession();
+void pollSessions(fd_set *rdSet, fd_set *wrSet);
+void processInput(fd_set *rdSet);
+void processOutput(fd_set *wrSet);
+void fillBuff(int fd, char *buf, int *start, int *size);
 
 
 int main(int argc, char **argv)
 {
+  fd_set rdSet, wrSet;
+  
   parseCmdLine(argc, argv);
-  printf("%s\t%d\n", shell, port);
-	
+
+  //start with the controlling session
+  sessions=newSession();
+  sessions->type = CONTROLLER;
+
+  //start the shell
+  startShell();
+
+  //the I/O loop
+  run = 1;
+  while(run) {
+    pollSessions(&rdSet, &wrSet);
+    processInput(&rdSet);
+    processOutput(&wrSet);
+  }
+  
   return 0;
 }
 
@@ -93,7 +122,7 @@ void parseCmdLine(int argc, char **argv)
   int opt;
 	
   //set defaults
-  shell = getenv("SHELL");
+  shellCmd = getenv("SHELL");
   port = 1337;
 	
   while((opt=getopt(argc, argv, "p:l:")) != -1) {
@@ -103,7 +132,7 @@ void parseCmdLine(int argc, char **argv)
       break;
 		  
     case 'l':
-      shell = optarg;
+      shellCmd = optarg;
       break;
 		  
     case 'h':
@@ -119,24 +148,26 @@ void parseCmdLine(int argc, char **argv)
   }
 }
 
+
 //Spawn a login shell. 
-//Returns the fd of the pts master of the
-//shell
+//The shell is added to the global environment
+//Returns 1 on success, 0 on failure
 int startShell() 
 {
   int pid;
   int fd;
   int sfd;
-	
+  struct session *session;
+  
   //get the master fd
   fd = getPty();
-  if(fd == -1) return -1;
+  if(fd == -1) return 0;
 	
   //open the slave
   sfd = openSlave(fd, O_RDWR | O_NOCTTY);
   if(sfd == -1) {
     close(fd);
-    return -1;
+    return 0;
   }
 	
   // spawn
@@ -144,12 +175,20 @@ int startShell()
   if(pid == -1) {
     close(fd);
     close(sfd);
-    return -1;
+    return 0;
   }
 	
-  //return fd to parent
+  //create the session and report success
   if(pid) {
-    return fd;
+    //create the session and set everything up
+    session = newSession();
+    if(!session) return 0;
+    session->fd=fd;
+    session->sfd=-1;
+    session->type=SHELL;
+    shell = session;
+    shellPid = pid;
+    return 1;
   }
 	
   //set up the child fd's
@@ -162,6 +201,82 @@ int startShell()
   dup(sfd);
 	
   //start the shell
-  execlp(shell, shell, NULL);
+  execlp(shellCmd, shellCmd, NULL);
 }
 	
+
+/* Creates a new session and links it into the global session list */
+struct session *newSession()
+{
+  struct session *result;
+
+  //create the session and link it in
+  result = malloc(sizeof(struct session));
+  if(!result) return NULL;
+  result->next = sessions;
+  sessions = result;
+
+  //the buffers start out empty
+  result->ridx=0;
+  result->wridx=0;
+  result->rsize=0;
+  result->wrsize=0;
+
+  //by default we have no fds
+  result->fd = -1;
+  result->sfd = -1;
+  return result;
+}
+
+
+void pollSessions(fd_set *rdSet, fd_set *wrSet)
+{
+  struct session *cur;
+  int maxfd = -1;
+  FD_ZERO(rdSet);
+  FD_ZERO(wrSet);
+
+  //go through all the sessions and add them to the rd and wr sets
+  for(cur = sessions; cur; cur=cur->next) {
+    //command uses the stdin and stdout fds
+    if(cur->type == COMMAND) {
+      FD_SET(STDIN_FILENO, rdSet);
+      FD_SET(STDOUT_FILENO, wrSet);
+      if(STDIN_FILENO > maxfd) {
+	maxfd = STDIN_FILENO;
+      }
+      if(STDOUT_FILENO > maxfd) {
+	maxfd = STDOUT_FILENO;
+      }
+    } else {
+      //everything else uses fd and sfd
+      if(cur->fd >= 0) {
+	FD_SET(cur->fd, rdSet);
+	FD_SET(cur->fd, wrSet);
+	if(cur->fd > maxfd)
+	  maxfd = cur->fd;
+      }
+      if(cur->sfd >= 0) {
+	FD_SET(cur->sfd, rdSet);
+	FD_SET(cur->sfd, wrSet);
+	if(cur->sfd > maxfd)
+	  maxfd = cur->sfd;
+      }
+    }
+  }
+
+  //now we do the select!
+  select(maxfd+1, rdSet, wrSet, NULL, NULL);
+
+  //TODO handle select errors
+}
+
+
+void processInput(fd_set *rdSet)
+{
+}
+
+
+void processOutput(fd_set *wrSet)
+{
+}
