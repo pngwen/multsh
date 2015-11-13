@@ -19,18 +19,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "tty_functions.h"
+#include "buffer.h"
 
 #define BUFSIZE 2048
 
 struct session {
-  int fd;       /* master pty for session */
-  int sfd;      /* socket file descriptor */
-  int ridx;     /* read index buffer */
-  int wridx;    /* write index for buff */
-  int rsize;    /* size of the read buffer */
-  int wrsize;   /* size of the write buffer */
-  unsigned char rbuf[BUFSIZE];  /* read buffer */
-  unsigned char wrbuf[BUFSIZE]; /* write buffer */
+  int fdin;    /* filedescriptor for writing */
+  int fdout;   /* filedescriptor for reading */
+  struct buffer buf;  /* the buffer for this node */
   enum {CONTROLLER, CLIENT, SHELL} type;  /* the type of the session */
   struct session *next;
 };
@@ -44,18 +40,16 @@ static int shellPid;
 static struct termios termPrev;   /* the starting status of our terminal */
 static int run;
 
-int getPty();
-int openSlave(int fd, int flags);
 void parseCmdLine(int argc, char **argv);
 int startShell();
 struct session *newSession();
 void pollSessions(fd_set *rdSet, fd_set *wrSet);
 void processInput(fd_set *rdSet);
 void processOutput(fd_set *wrSet);
-void fillBuff(int fd, char *buf, int *start, int *size);
 
 
-int main(int argc, char **argv)
+int
+main(int argc, char **argv)
 {
   fd_set rdSet, wrSet;
   
@@ -80,44 +74,10 @@ int main(int argc, char **argv)
 }
 
 
-//Return a master pty fd -1 on failure
-int getPty()
-{
-  int fd;
-	
-  //open a pty master
-  fd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
-  return fd;
-}
 
 
-//open the slave pty with guven flags
-int openSlave(int fd, int flags) 
-{
-  char *sname;
-	
-  //take ownership of the slave pty
-  if(grantpt(fd) == -1) {
-    return -1;
-  }
-	
-  //unlock the slave
-  if(unlockpt(fd) == -1) {
-    return -1;
-  }
-	
-  //get the slave name
-  sname = ptsname(fd);
-  if(!sname) {
-    return -1;
-  }
-	
-  //get and return the fd
-  return open(sname, flags);
-}
-
-
-void parseCmdLine(int argc, char **argv)
+void
+parseCmdLine(int argc, char **argv)
 {
   int opt;
 	
@@ -152,61 +112,17 @@ void parseCmdLine(int argc, char **argv)
 //Spawn a login shell. 
 //The shell is added to the global environment
 //Returns 1 on success, 0 on failure
-int startShell() 
+int
+startShell() 
 {
-  int pid;
-  int fd;
-  int sfd;
-  struct session *session;
-  
-  //get the master fd
-  fd = getPty();
-  if(fd == -1) return 0;
-	
-  //open the slave
-  sfd = openSlave(fd, O_RDWR | O_NOCTTY);
-  if(sfd == -1) {
-    close(fd);
-    return 0;
-  }
-	
-  // spawn
-  pid = fork();
-  if(pid == -1) {
-    close(fd);
-    close(sfd);
-    return 0;
-  }
-	
-  //create the session and report success
-  if(pid) {
-    //create the session and set everything up
-    session = newSession();
-    if(!session) return 0;
-    session->fd=fd;
-    session->sfd=-1;
-    session->type=SHELL;
-    shell = session;
-    shellPid = pid;
-    return 1;
-  }
-	
-  //set up the child fd's
-  close(fd);
-  close(STDIN_FILENO);
-  close(STDOUT_FILENO);
-  close(STDERR_FILENO);
-  dup(sfd);
-  dup(sfd);
-  dup(sfd);
-	
   //start the shell
   execlp(shellCmd, shellCmd, NULL);
 }
 	
 
 /* Creates a new session and links it into the global session list */
-struct session *newSession()
+struct session *
+newSession()
 {
   struct session *result;
 
@@ -217,19 +133,17 @@ struct session *newSession()
   sessions = result;
 
   //the buffers start out empty
-  result->ridx=0;
-  result->wridx=0;
-  result->rsize=0;
-  result->wrsize=0;
+  BUF_INIT(result->buf);
 
   //by default we have no fds
-  result->fd = -1;
-  result->sfd = -1;
+  result->fdin = -1;
+  result->fdout = -1;
   return result;
 }
 
 
-void pollSessions(fd_set *rdSet, fd_set *wrSet)
+void
+pollSessions(fd_set *rdSet, fd_set *wrSet)
 {
   struct session *cur;
   int maxfd = -1;
@@ -272,11 +186,13 @@ void pollSessions(fd_set *rdSet, fd_set *wrSet)
 }
 
 
-void processInput(fd_set *rdSet)
+void
+processInput(fd_set *rdSet)
 {
 }
 
 
-void processOutput(fd_set *wrSet)
+void
+processOutput(fd_set *wrSet)
 {
 }

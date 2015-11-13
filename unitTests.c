@@ -5,7 +5,8 @@
 //test prototypes
 void bufferTest();
 
-int main() {
+int
+main() {
   bufferTest();
 
   return 0;
